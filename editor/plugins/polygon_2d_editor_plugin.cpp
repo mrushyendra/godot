@@ -345,9 +345,10 @@ void Polygon2DEditor::_menu_option(int p_option) {
 }
 
 void Polygon2DEditor::_cancel_editing() {
-	if (uv_create) {
+	if (uv_create || uv_add) {
 		uv_drag = false;
 		uv_create = false;
+		uv_add = false;
 		node->set_uv(uv_create_uv_prev);
 		node->set_polygon(uv_create_poly_prev);
 		node->set_internal_vertex_count(uv_create_prev_internal_vertices);
@@ -624,16 +625,78 @@ void Polygon2DEditor::_uv_input(const Ref<InputEvent> &p_input) {
 
 				if (uv_move_current == UV_MODE_EDIT_POINT) {
 					point_drag_index = -1;
-					for (int i = 0; i < points_prev.size(); i++) {
-						Vector2 tuv = mtx.xform(points_prev[i]);
-						if (tuv.distance_to(Vector2(mb->get_position().x, mb->get_position().y)) < 8) {
-							uv_drag_from = tuv;
-							point_drag_index = i;
+					bool found_edge_pt = false;
+
+					// Check if selected point is close to an existing edge
+					const real_t grab_threshold = (8 / uv_draw_zoom);
+					const real_t eps = grab_threshold * 2;
+					const real_t eps2 = eps * eps;
+
+					Vector2 closest_pt;
+					int closest_idx = 0;
+					real_t closest_dist = 1e10;
+
+					const int n_points = points_prev.size();
+					Vector2 p_pos = mtx.affine_inverse().xform(snap_point(Vector2(mb->get_position().x, mb->get_position().y)));
+
+					for (int i = 0; i < n_points; i++) {
+						Vector2 segment[2] = { points_prev[i], points_prev[(i + 1) % n_points] };
+						Vector2 cp = Geometry2D::get_closest_point_to_segment(p_pos, segment);
+						if (cp.distance_squared_to(segment[0]) < eps2 || cp.distance_squared_to(segment[1]) < eps2) {
+							continue; // Not valid to reuse point
+						}
+						real_t d = cp.distance_to(p_pos);
+						if (d < closest_dist && d < grab_threshold) {
+							closest_dist = d;
+							closest_pt = cp;
+							closest_idx = i + 1;
+							found_edge_pt = true;
 						}
 					}
 
-					if (point_drag_index == -1) {
-						uv_drag = false;
+					if (found_edge_pt) { // Add new vertex on edge at selected point
+						uv_create_uv_prev = node->get_uv();
+						uv_create_poly_prev = node->get_polygon();
+						uv_create_prev_internal_vertices = node->get_internal_vertex_count();
+						uv_create_colors_prev = node->get_vertex_colors();
+
+						undo_redo->create_action(TTR("Insert Vertex"));
+						undo_redo->add_do_method(node, "set_uv", node->get_uv());
+						undo_redo->add_undo_method(node, "set_uv", uv_create_uv_prev);
+						undo_redo->add_do_method(node, "set_polygon", node->get_polygon());
+						undo_redo->add_undo_method(node, "set_polygon", uv_create_poly_prev);
+						undo_redo->add_do_method(node, "set_vertex_colors", Vector<Color>());
+						undo_redo->add_undo_method(node, "set_vertex_colors", uv_create_colors_prev);
+						undo_redo->add_do_method(this, "_update_polygon_editing_state");
+						undo_redo->add_undo_method(this, "_update_polygon_editing_state");
+						undo_redo->add_do_method(uv_edit_draw, "update");
+						undo_redo->add_undo_method(uv_edit_draw, "update");
+						undo_redo->commit_action();
+
+						uv_add = true;
+						points_prev.insert(closest_idx, closest_pt);
+						point_drag_index = closest_idx;
+						uv_drag_from = mtx.xform(points_prev[closest_idx]);
+						node->set_polygon(points_prev);
+						node->set_uv(points_prev);
+						if (uv_create_colors_prev.size()) {
+							Vector<Color> uv_create_colors_new = uv_create_colors_prev;
+							uv_create_colors_new.insert(closest_idx, node->get_color());
+							node->set_vertex_colors(uv_create_colors_new);
+						}
+					} else {
+						for (int i = 0; i < points_prev.size(); i++) {
+							Vector2 tuv = mtx.xform(points_prev[i]);
+							if (tuv.distance_to(Vector2(mb->get_position().x, mb->get_position().y)) < 8) {
+								uv_drag_from = tuv;
+								point_drag_index = i;
+							}
+						}
+
+						if (point_drag_index == -1) {
+							uv_drag = false;
+							uv_add = false;
+						}
 					}
 				}
 
@@ -730,7 +793,9 @@ void Polygon2DEditor::_uv_input(const Ref<InputEvent> &p_input) {
 				}
 			} else {
 				if (uv_drag && !uv_create) {
-					if (uv_edit_mode[0]->is_pressed()) { // Edit UV.
+					if (uv_add) {
+						uv_add = false;
+					} else if (uv_edit_mode[0]->is_pressed()) { // Edit UV.
 						undo_redo->create_action(TTR("Transform UV Map"));
 						undo_redo->add_do_method(node, "set_uv", node->get_uv());
 						undo_redo->add_undo_method(node, "set_uv", points_prev);
@@ -798,7 +863,10 @@ void Polygon2DEditor::_uv_input(const Ref<InputEvent> &p_input) {
 					Vector<Vector2> uv_new = points_prev;
 					uv_new.set(point_drag_index, uv_new[point_drag_index] + drag);
 
-					if (uv_edit_mode[0]->is_pressed()) { //edit uv
+					if (uv_add && (uv_edit_mode[0]->is_pressed() || uv_edit_mode[1]->is_pressed())) {
+						node->set_uv(uv_new);
+						node->set_polygon(uv_new);
+					} else if (uv_edit_mode[0]->is_pressed()) { //edit uv
 						node->set_uv(uv_new);
 					} else if (uv_edit_mode[1]->is_pressed()) { //edit polygon
 						node->set_polygon(uv_new);
